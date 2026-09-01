@@ -2,7 +2,10 @@ import { createHash } from 'node:crypto';
 import {
   appendFile, copyFile, mkdir, open, opendir, readFile, rename, rm, stat, writeFile,
 } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
+import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 
 export const refusalCodes = [
@@ -158,6 +161,17 @@ export class LocalBoundary {
   }
 }
 
+/**
+ * A path, as a string or as RAW BYTES.
+ *
+ * Bytes because a path is a byte string in the reference, and because the
+ * corpus's byte-injection cases cannot be expressed as JavaScript strings at
+ * all -- an invalid UTF-8 sequence becomes U+FFFD on the way in, so a
+ * string-only API could never carry the attack the guard exists to refuse.
+ * Everything downstream of `admit()` sees the guarded string.
+ */
+export type WorkspacePath = string | Uint8Array;
+
 export type WorkspaceAbility = 'read' | 'write' | 'delete' | 'list';
 export type Authorizer = (ability: WorkspaceAbility, workspace: Workspace, path?: string) => void | Promise<void>;
 
@@ -189,9 +203,9 @@ export class Workspace {
     this.authorize = options.authorize;
   }
 
-  path(path: string): string { return this.guard.guard(path); }
+  path(path: WorkspacePath): string { return this.guard.guard(path); }
 
-  async exists(path: string): Promise<boolean> {
+  async exists(path: WorkspacePath): Promise<boolean> {
     const admitted = await this.admit(path, 'read');
     try { await stat(this.absolute(admitted)); return true; } catch (error) {
       if (isMissing(error)) return false;
@@ -199,65 +213,127 @@ export class Workspace {
     }
   }
 
-  async read(path: string): Promise<string> {
+  async read(path: WorkspacePath): Promise<string> {
     const admitted = await this.admit(path, 'read');
     try { return await readFile(this.absolute(admitted), 'utf8'); }
     catch (error) { if (isMissing(error)) throw missing(path, error); throw error; }
   }
 
-  async write(path: string, contents: string | Uint8Array): Promise<this> {
+  /**
+   * The bytes, undecoded.
+   *
+   * `read()` decodes as UTF-8, which silently corrupts anything that is not
+   * text — and an agent workspace holds images and archives as readily as it
+   * holds source. `prism-workspace-py` had this and this port did not, which is
+   * the drift the parity work exists to catch.
+   */
+  async readBytes(path: WorkspacePath): Promise<Uint8Array> {
+    const admitted = await this.admit(path, 'read');
+    try { return Uint8Array.from(await readFile(this.absolute(admitted))); }
+    catch (error) { if (isMissing(error)) throw missing(path, error); throw error; }
+  }
+
+  /**
+   * A readable stream over the file, for content too large to hold in memory.
+   *
+   * Goes through `admit()` like every other read, BEFORE the handle is opened.
+   * A streaming accessor that skipped the guard would be a hole straight
+   * through the boundary this package exists to be, and it would look like an
+   * optimisation.
+   */
+  async readStream(path: WorkspacePath): Promise<Readable> {
+    const admitted = await this.admit(path, 'read');
+    let handle: FileHandle;
+
+    try { handle = await open(this.absolute(admitted), 'r'); }
+    catch (error) { if (isMissing(error)) throw missing(path, error); throw error; }
+
+    // `autoClose` is the default for a handle-backed stream, but it is stated
+    // rather than assumed: a leaked descriptor per read is invisible until a
+    // long-running agent exhausts the table.
+    return handle.createReadStream({ autoClose: true });
+  }
+
+  /**
+   * Write from a stream, without buffering the whole payload.
+   *
+   * Accepts anything iterable in chunks, so a caller can pipe a download or a
+   * generator straight in. Parent directories are created first, matching
+   * `write()`.
+   */
+  async writeStream(
+    path: WorkspacePath,
+    source: Readable | AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>,
+  ): Promise<this> {
+    const admitted = await this.admit(path, 'write');
+    const target = this.absolute(admitted);
+
+    try {
+      await mkdir(dirname(target), { recursive: true });
+      const handle = await open(target, 'w');
+
+      try { await pipeline(source as AsyncIterable<Uint8Array>, handle.createWriteStream()); }
+      finally { await handle.close().catch(() => undefined); }
+
+      return this;
+    } catch (error) {
+      throw failed('workspace_write_failed', `Could not write [${path}] to this workspace.`, error);
+    }
+  }
+
+  async write(path: WorkspacePath, contents: string | Uint8Array): Promise<this> {
     const admitted = await this.admit(path, 'write');
     const target = this.absolute(admitted);
     try { await mkdir(dirname(target), { recursive: true }); await writeFile(target, contents); return this; }
     catch (error) { throw failed('workspace_write_failed', `Could not write [${path}] to this workspace.`, error); }
   }
 
-  async append(path: string, contents: string | Uint8Array): Promise<this> {
+  async append(path: WorkspacePath, contents: string | Uint8Array): Promise<this> {
     const admitted = await this.admit(path, 'write');
     const target = this.absolute(admitted);
     try { await mkdir(dirname(target), { recursive: true }); await appendFile(target, contents); return this; }
     catch (error) { throw failed('workspace_write_failed', `Could not append [${path}] to this workspace.`, error); }
   }
 
-  async copy(from: string, to: string): Promise<this> {
+  async copy(from: WorkspacePath, to: WorkspacePath): Promise<this> {
     const source = await this.admit(from, 'read');
     const destination = await this.admit(to, 'write');
     try { await mkdir(dirname(this.absolute(destination)), { recursive: true }); await copyFile(this.absolute(source), this.absolute(destination)); return this; }
     catch (error) { throw failed('workspace_write_failed', `Could not copy [${from}] to [${to}].`, error); }
   }
 
-  async move(from: string, to: string): Promise<this> {
+  async move(from: WorkspacePath, to: WorkspacePath): Promise<this> {
     const source = await this.admit(from, 'write');
     const destination = await this.admit(to, 'write');
     try { await mkdir(dirname(this.absolute(destination)), { recursive: true }); await rename(this.absolute(source), this.absolute(destination)); return this; }
     catch (error) { throw failed('workspace_write_failed', `Could not move [${from}] to [${to}].`, error); }
   }
 
-  async delete(path: string): Promise<this> {
+  async delete(path: WorkspacePath): Promise<this> {
     const admitted = await this.admit(path, 'delete');
     try { await rm(this.absolute(admitted), { force: true }); return this; }
     catch (error) { throw failed('workspace_delete_failed', `Could not delete [${path}] from this workspace.`, error); }
   }
 
-  async makeDirectory(path: string): Promise<this> {
+  async makeDirectory(path: WorkspacePath): Promise<this> {
     const admitted = await this.admit(path, 'write');
     try { await mkdir(this.absolute(admitted), { recursive: true }); return this; }
     catch (error) { throw failed('workspace_write_failed', `Could not create [${path}].`, error); }
   }
 
-  async deleteDirectory(path: string): Promise<this> {
+  async deleteDirectory(path: WorkspacePath): Promise<this> {
     const admitted = await this.admit(path, 'delete');
     try { await rm(this.absolute(admitted), { recursive: true, force: true }); return this; }
     catch (error) { throw failed('workspace_delete_failed', `Could not delete [${path}].`, error); }
   }
 
-  async size(path: string): Promise<number> {
+  async size(path: WorkspacePath): Promise<number> {
     const admitted = await this.admit(path, 'read');
     try { return (await stat(this.absolute(admitted))).size; }
     catch (error) { if (isMissing(error)) throw missing(path, error); throw error; }
   }
 
-  async lastModified(path: string): Promise<number> {
+  async lastModified(path: WorkspacePath): Promise<number> {
     const admitted = await this.admit(path, 'read');
     try { return Math.floor((await stat(this.absolute(admitted))).mtimeMs / 1000); }
     catch (error) { if (isMissing(error)) throw missing(path, error); throw error; }
@@ -287,7 +363,7 @@ export class Workspace {
     }
   }
 
-  private async admit(path: string, ability: WorkspaceAbility): Promise<string> {
+  private async admit(path: WorkspacePath, ability: WorkspaceAbility): Promise<string> {
     const guarded = this.guard.guard(path);
     await this.authorize?.(ability, this, guarded);
     this.boundary.admit(guarded);
@@ -300,7 +376,7 @@ export class Workspace {
 function isMissing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
 }
-function missing(path: string, cause: unknown): WorkspaceFailed {
+function missing(path: WorkspacePath, cause: unknown): WorkspaceFailed {
   return new WorkspaceFailed('workspace_file_missing', `There is no [${path}] in this workspace.`, { cause });
 }
 function failed(code: FaultCode, message: string, cause: unknown): WorkspaceFailed {

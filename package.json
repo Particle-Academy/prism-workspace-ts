@@ -5,11 +5,26 @@
   "type": "module",
   "private": true,
   "sideEffects": false,
-  "engines": { "node": ">=20" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist", "src/security/escape-corpus.json", "LICENSE"],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./corpus": {
+      "types": "./dist/corpus-runner.d.ts",
+      "import": "./dist/corpus-runner.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/security/escape-corpus.json",
+    "LICENSE"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
