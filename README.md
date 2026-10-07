@@ -7,7 +7,9 @@ realpath-based symlink containment.
 
 Zero runtime dependencies. Node 22+.
 
-This package is private while coordinated parity work is in progress.
+```
+npm install @particle-academy/prism-workspace
+```
 
 ## Verify it on YOUR disk
 
