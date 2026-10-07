@@ -5,7 +5,7 @@ Promise-based local workspace, stable owner addressing, optional authorization,
 streamed directory listings, stable failure codes, lexical path guarding, and
 realpath-based symlink containment.
 
-Zero runtime dependencies. Node 20+.
+Zero runtime dependencies. Node 22+.
 
 This package is private while coordinated parity work is in progress.
 
